@@ -1,0 +1,876 @@
+# R code for additive hazards model with time-varying covariates and partly interval censored data
+# AH_MPL.control: Function to control model parameters 
+# basis: names of the basis approximating the baseline hazard function.
+# n.obs_basis: number of observed time points per uniform basis (for the uniform basis, we use equal count in each bin).
+# n.knots: a vector of 2 integers for Gaussian or M-spline basis. 
+#.         The first one shows the number of quantile knots to be set between the range.quant
+#          quantile of the non-right censored observations. The second one specifies the number of equally spaced 
+#          knots to be set outside the range of the quantile knots. 
+# range.quant: the range of the quantile knots for Gaussian or M-spline basis.
+# cover.sigma.quant: the proportion of non right-censored observations that should belong to the interval defined by
+#                    quantile of 0.025 and 0.975 of each truncated Gaussian base corresponding to a quantile knot.
+# cover.sigma.fixed: the proportion of the observations that should belong to the interval defined by the quantiles
+#                    0.025 and 0.975 of each un-truncated Gaussian base corresponding to each fixed knot.
+# order: an integer specifying the order of the msplines basis. 
+# smooth: smooth parameter
+# max.iter: a vector with the first value defining the maximum number of iterations for selecting the smooth parameter,
+#           the second value the maximum number of iterations for estimating the Theta, and Beta, and
+#           the third value the total number of iterations allowed.
+# tol_1: convergence tolerance value for the Primal-Dual (PD) interior point algorithm.
+# tol_2: convergence tolerance value for the smooth value selection algorithm
+# tau: parameter in PD interior point algorithm
+# min.theta: the minimal baseline hazard estimate value, below which the theta estimates will be considered to be 0.
+basis.name_mpl <- function(k){
+  if (k == "uniform")
+    "uniform"
+  else if (k == "gaussian")
+    "gaussian"
+  else if (k == "msplines")
+    "msplines"
+  else
+    stop("Unkown basis choice")
+}
+AH_MPL.control = 
+  function (basis = "uniform", n.obs_basis = NULL, n.knots = NULL, 
+            range.quant = 0.9, cover.sigma.quant = 0.25, cover.sigma.fixed = 0.25, 
+            order = 3L, smooth = NULL, max.iter = c(100, 300, 5000),
+            tol_1 = 1e-10, tol_2 = 1e-5, tau = 1000, min.theta = 1e-10) 
+  {
+    basis = basis.name_mpl(basis)
+    n.obs_basis = ifelse(n.obs_basis > 0, n.obs_basis, 5)
+    if (is.null(n.knots) | sum(n.knots) < 3 | length(n.knots) != 
+        2) {
+      n.knots = c(8, 2)
+    }
+    range.quant = ifelse(range.quant > 0 & range.quant < 1, range.quant, 0.9)
+    cover.sigma.quant = ifelse(cover.sigma.quant > 0 & cover.sigma.quant < 
+                                 0.4, cover.sigma.quant, 0.3)
+    cover.sigma.fixed = ifelse(cover.sigma.fixed > 0 & cover.sigma.fixed < 
+                                 0.4, cover.sigma.fixed, 0.3)
+    order = ifelse(order > 0 & order < 6, as.integer(order), 3L)
+    if (!is.null(smooth)) {
+      smooth = ifelse(smooth < 0, 1000, smooth)
+    }
+    else {
+      smooth = 1000
+    }
+    max.iter = c(ifelse(max.iter[1] > 0, as.integer(max.iter[1]), 100), 
+                 ifelse(max.iter[2] > 0, as.integer(max.iter[2]), 300), 
+                 ifelse(length(max.iter) == 2, 5000, 
+                        ifelse(max.iter[3] > ifelse(max.iter[2] > 0, as.integer(max.iter[2]), 5000), 
+                               as.integer(max.iter[3]), 5000)))
+    tol_1 = ifelse(tol_1 > 0 & tol_1 < 1, tol_1, 1e-10)
+    tol_2 = ifelse(tol_2 > 0, tol_2, 1e-3)
+    tau = ifelse(tau > 0, tau, 1000)
+    min.theta = ifelse(min.theta > 0 & min.theta < 0.001, min.theta, 
+                       1e-10)
+    out = list(basis = basis, n.obs_basis = n.obs_basis, n.knots = n.knots, 
+               range.quant = range.quant, cover.sigma.quant = cover.sigma.quant,
+               cover.sigma.fixed = cover.sigma.fixed, order = order,
+               smooth = smooth, max.iter = max.iter, 
+               tol_1 = tol_1, tol_2 = tol_2, tau = tau, min.theta = min.theta)
+    out
+  }
+# bins_mpl: Function to determine bins and bin length  
+# input:
+#   control: model parameters in AH_MPL.control (control = AH_MPL.control())
+#   t_i1: observed time for left censoring, uncensoring, right censoring and left-end point of finite interval censoring
+#   t_i2: observed time for right-end point of finite interval censoring
+#   ctype: a matrix for censoring indicators
+#   example:              ctype
+#          t_i1    t_i2     r    e    l     i
+#           a        1      NA   NA   TRUE  NA   (left censored at a)
+#           b        1      TRUE NA   NA    NA   (right censored at b)
+#           c        d      NA   NA   NA    TRUE (finite interval censored between (c, d))
+#           f        1      NA   TRUE NA    NA   (exactly observed at f)
+# output:
+#   m: number of bins
+#   Alpha: edge points at each bin
+#   Delta: bin length
+#   Sigma: variance for Gaussian basis
+bins_mpl = function (control, t_i1, t_i2, ctype) 
+{
+  event = c(t_i1[ctype[, "e"]], t_i1[ctype[, "i"]], t_i2[ctype[, "i"]], 
+            t_i1[ctype[, "l"]])
+  order_event = sort(event)
+  n.event = length(order_event)
+  if (control$basis == "uniform") {
+    count = control$n.obs_basis
+    m = ceiling(n.event/count)
+    Alpha = matrix(0, m + 1, 1)
+    for (j in 2:m){
+      Alpha[j] = order_event[(j-1) * count]
+    }
+    Alpha[m + 1] = max(event)
+    Delta = diff(Alpha)
+    list(m = m, Alpha = Alpha, Delta = Delta)
+  }
+  else {
+    if (control$n.knots[2] == 0) {
+      Alpha = quantile(event, seq(0, 1, length.out = (control$n.knots[1] + 2)))
+    }
+    else {
+      Alpha1 = quantile(event, seq(0, control$range.quant, length.out = (control$n.knots[1] + 1)))
+      Alpha2 = seq(quantile(event, control$range.quant), max(event), length = control$n.knots[2] + 2)
+      Alpha = c(Alpha1, Alpha2[-1])
+    }
+    n.Alpha = length(Alpha)
+    if (control$basis == "gaussian") {
+      Sigma = Delta = rep(0, n.Alpha)
+      for (aw in 1:n.Alpha) {
+        if (aw > 1 & aw < (n.Alpha - control$n.knots[2])) {
+          while (sum(event > (Alpha[aw] - 2 * Sigma[aw]) & event < (Alpha[aw] + 2 * Sigma[aw])) < 
+                 (n.event * control$cover.sigma.quant)) {
+            Sigma[aw] = Sigma[aw] + 0.001
+          }
+        }
+        else {
+          Sigma[aw] = control$cover.sigma.fixed * (Alpha[n.Alpha] - Alpha[1])/3
+        }
+        Delta[aw] = pnorm((max(order_event) - Alpha[aw])/Sigma[aw]) - 
+          pnorm((min(order_event) - 1e-16 - Alpha[aw])/Sigma[aw])
+      }
+      list(m = n.Alpha, Alpha = Alpha, Sigma = Sigma, Delta = Delta)
+    }
+    if (control$basis == "msplines") {
+      m = n.Alpha + control$order - 2
+      list(m = m, Alpha = Alpha, Delta = rep(1, m))
+    }
+    else {
+      stop("Unkown basis choice")
+    }
+  }
+}
+# basis_mpl: Function to determine basis for approximating baseline hazards
+# input: 
+#   x: time points to be evaluated
+#   bins: output of the function bins_mpl
+#   basis: names for basis functions
+#   order: an integer specifying the order of the msplines basis. 
+#   which: 1 for baseline hazard and 2 for cumulative baseline hazard
+# output:
+#   M_psi_nm: basis for baseline hazard
+#   M_Psi_nm: basis for cumulative baseline hazard
+basis_mpl=function(x, bins, basis, order, which = c(1, 2)) 
+{
+  which.matrix = rep(T, 2)
+  which.matrix[-which] = FALSE
+  n = length(x)
+  Alpha = bins$Alpha
+  Delta = bins$Delta
+  n.Alpha = length(Alpha)
+  m = ifelse(basis == "msplines", n.Alpha + order - 2, bins$m)
+  M_Psi_nm = M_psi_nm = matrix(0, n, m)
+  if (basis == "uniform") {
+    u_i = sapply(x, function(y, lim = Alpha[-1L]) sum(lim < y) + 1L)
+    for (i in 1:n) {
+      M_psi_nm[i, u_i[i]] = 1
+      M_Psi_nm[i, 1:u_i[i]] = c(if (u_i[i] > 1) {Delta[1:(u_i[i] - 1)]}, 
+                                x[i] - Alpha[u_i[i]])
+    }
+  }
+  else {
+    if (basis == "gaussian") {
+      Sigma = bins$Sigma
+      for (u in 1:m) {
+        M_psi_nm[, u] = dnorm((x - Alpha[u])/Sigma[u])/(Sigma[u] * 
+                                                          Delta[u])
+        M_Psi_nm[, u] = (pnorm((x - Alpha[u])/Sigma[u]) - 
+                           pnorm((Alpha[1] - Alpha[u])/Sigma[u]))/Delta[u]
+      }
+    }
+    else {
+      seq1n = 1:n
+      Alpha_star = as.numeric(c(rep(Alpha[1], order - 1L), 
+                                Alpha, rep(Alpha[n.Alpha], order - 1L)))
+      M_psi_nm = M_Psi_nm = cbind(M_psi_nm, 0)
+      if (which.matrix[1]) {
+        Alpha_star_x = sapply(x, function(y, lim = Alpha[-1L]) sum(lim < y) + 1L) + order - 1L
+        M_psi_nm[(Alpha_star_x - 1L) * n + seq1n] = 1/(Alpha_star[Alpha_star_x + 1] - 
+                                                         Alpha_star[Alpha_star_x])
+        if (order > 1) {
+          for (ow in 2L:order) {
+            uw_x = Alpha_star_x - ow + 1L
+            for (pw in 0:(ow - 1L)) {
+              pos_x = (uw_x + pw - 1L) * n + seq1n
+              M_psi_nm[pos_x] = (ow/((ow - 1) * (Alpha_star[1:m + ow] - Alpha_star[1:m])))[uw_x + pw] * 
+                ((x - Alpha_star[uw_x + pw]) * M_psi_nm[pos_x] + 
+                   (Alpha_star[uw_x + pw + ow] - x) * M_psi_nm[pos_x + n])
+            }
+          }
+        }
+        M_psi_nm = M_psi_nm[, 1:m, drop = FALSE]
+      }
+      if (which.matrix[2]) {
+        rank.x = rank(x)
+        x = x[order(x)]
+        Alpha_x = sapply(x, function(y, lim = Alpha[-1L]) sum(lim < y) + 1L)
+        up_u = cumsum(tabulate(Alpha_x, n.Alpha - 1))
+        for (uw in 1:(m - order + 1)) {
+          M_Psi_nm[min(n, up_u[uw] + 1):n, uw] = 1
+        }
+        Alpha_star2 = c(rep(Alpha[1], order), Alpha, rep(Alpha[n.Alpha], order))
+        factor_v = c((Alpha_star2[(order + 2):length(Alpha_star2)] - 
+                        Alpha_star2[1:(length(Alpha_star2) - order - 1)])/(order + 1), rep(0, order - 1))
+        M_psi2_nm = cbind(basis_mpl(x, bins, basis = basis, order = order + 1, which = 1), 
+                          matrix(0, n, order - 1))
+        # M_psi2_nm = cbind(basis_mpl(x, bins, basis = basis, order = order + 1, which = 1), matrix(0, n, order))
+        pos_xo = rep((Alpha_x - 1L) * n, 1) + seq1n
+        pos_xo1 = rep(pos_xo, order) + rep(1:order, each = n) * n
+        for (ow in 0:(order - 1)) {
+          M_Psi_nm[pos_xo + ow * n] = apply(matrix(M_psi2_nm[pos_xo1 + ow * n] * 
+                                                     factor_v[rep(Alpha_x, order) + rep((1:order) + ow, each = n)], 
+                                                   ncol = order), 1, sum)
+        }
+        M_Psi_nm = M_Psi_nm[rank.x, 1:m, drop = FALSE]
+      }
+    }
+  }
+  if (all(which.matrix)) {
+    list(psi = M_psi_nm, Psi = M_Psi_nm)
+  }
+  else {
+    if (which.matrix[1]) {
+      M_psi_nm
+    }
+    else {
+      M_Psi_nm
+    }
+  }
+}
+# penalty_mpl: R matrix in the penalty term 
+# input:
+#   control: model parameters in AH_MPL.control (control = AH_MPL.control())
+#   bins: output of the function bins_mpl (bins = bins_mpl(control, t_i1, t_i2, ctype))
+# output:
+#   M_R_mm: R matrix in the penalty term
+#   second order penalty matrices are available for the "uniform" and "Gaussian" bases
+#   the penalty matrix of the "msplines" basis is set to order-1
+
+penalty_mpl=function (control, bins) 
+{
+  m = bins$m
+  M_R_mm = matrix(0, m, m)
+  if (control$basis == "uniform") {
+    for (u in 1:m){
+      M_R_mm[u, u] = 6
+    }
+    for (u in 1: (m-1)){
+      M_R_mm[u+1, u] = -4
+      M_R_mm[u, u+1] = -4
+    }
+    for (u in 1: (m-2)){
+      M_R_mm[u, u+2] = 1
+      M_R_mm[u+2, u] = 1
+    }
+    M_R_mm[1, 1] = M_R_mm[m, m] = 1
+    M_R_mm[2, 2] = M_R_mm[m-1, m-1] = 5
+    M_R_mm[2, 1] = M_R_mm[1, 2] = M_R_mm[m, m-1] = M_R_mm[m-1, m] = -2
+  }
+  else {
+    if (control$basis == "gaussian") {
+      int_rij_2.fun = function(x, mu_i, mu_j, sig_i, sig_j, t1, tn) {
+        K = 4 * (pnorm((t1 - mu_i)/sig_i) - pnorm((tn - mu_i)/sig_i)) * 
+          (pnorm((t1 - mu_j)/sig_j) - pnorm((tn - mu_j)/sig_j))
+        q1q2a = 4 * dnorm(x, mu_i, sig_i) * dnorm(x, mu_j, sig_j) * sig_i * sig_j * 2 * pi * sqrt(sig_i^2 + sig_j^2) * 
+          ((mu_j - x) * sig_i^6 * ((x - mu_i)^2 - sig_i^2) + 
+             sig_i^4 * sig_j^2 * ((x - 4 * mu_j + 3 * mu_i) * sig_i^2 - (x - mu_i)^2 * (3 * x - 4 * mu_j + mu_i)) - 
+             sig_i^2 * sig_j^4 * (x - mu_j)^2 * (3 * x - 4 * mu_i + mu_j) + 
+             sig_j^6 * ((x + 3 * mu_j - 4 * mu_i) * sig_i^2 - (x - mu_j)^2 * (x - mu_i)) + 
+             sig_j^8 * (x - mu_i))
+        q1q2b = 2 * dnorm(mu_j, mu_i, sqrt(sig_i^2 + sig_j^2)) * pi * sqrt(sig_i^2 + sig_j^2) * sig_i^3 * sig_j^3 * 
+          (mu_j^4 - 4 * mu_j^3 * mu_i + mu_i^4 + 6 * mu_j^2 * (mu_i^2 - sig_i^2 - sig_j^2) - 6 * mu_i^2 * (sig_i^2 + sig_j^2) + 
+             3 * (sig_i^2 + sig_j^2)^2 - 4 * mu_i * mu_j * (mu_i^2 - 3 * (sig_i^2 + sig_j^2))) * 
+          (2 * pnorm(((x - mu_j) * sig_i^2 + (x - mu_i) * sig_j^2)/(sig_i * sig_j * sqrt(sig_i^2 + sig_j^2))) - 1)
+        q3 = pi * sig_i^3 * sig_j^3 * (sig_i^2 + sig_j^2)^(9/2) * K
+        (q1q2a + q1q2b)/q3
+      }
+      for (i in 1:m) {
+        for (j in i:m) {
+          M_R_mm[i, j] = M_R_mm[j, i] = int_rij_2.fun(bins$Alpha[m], 
+                                                      bins$Alpha[i], bins$Alpha[j], bins$Sigma[i], 
+                                                      bins$Sigma[j], bins$Alpha[1], bins$Alpha[m]) - 
+            int_rij_2.fun(bins$Alpha[1], bins$Alpha[i], 
+                          bins$Alpha[j], bins$Sigma[i], bins$Sigma[j], 
+                          bins$Alpha[1], bins$Alpha[m])
+        }
+      }
+    }
+    else {
+      Alpha = bins$Alpha
+      n.Alpha = length(Alpha)
+      order = control$order
+      Alpha_star = c(rep(Alpha[1], order - 1L), Alpha, rep(Alpha[n.Alpha], order - 1L))
+      seq1n = 1L:(n.Alpha - 1)
+      n.Alpha_star = length(Alpha_star)
+      Alpha_star_x = sapply(Alpha[-1], function(y, lim = Alpha[-1L]) sum(lim < y) + 1L) + order - 1L
+      M_d2f_mm = matrix(0, n.Alpha - 1, n.Alpha + order - 1L)
+      M_d2f_mm[(Alpha_star_x - 1L) * (n.Alpha - 1) + seq1n] = 
+        1/(Alpha_star[Alpha_star_x + 1] - Alpha_star[Alpha_star_x])
+      for (ow in 2L:order) {
+        pw = 1L:ow
+        uw_x = Alpha_star_x - ow + 1L
+        for (pw in 0:(ow - 1L)) {
+          M_d2f_mm[(uw_x + pw - 1L) * (n.Alpha - 1) + seq1n] = 
+            (ow/(Alpha_star[1:(n.Alpha + ow) + ow] - Alpha_star[1:(n.Alpha + ow)]))[uw_x + pw] * 
+            (M_d2f_mm[(uw_x + pw - 1L) * (n.Alpha - 1) + seq1n] - M_d2f_mm[(uw_x + pw) * (n.Alpha - 1) + seq1n])
+        }
+      }
+      M_d2f_mm = M_d2f_mm[, 1:m, drop = FALSE]
+      for (uw in 1:m) {
+        for (vw in uw:m) {
+          M_R_mm[uw, vw] = M_R_mm[vw, uw] = sum((M_d2f_mm[, uw] * M_d2f_mm[, vw]) * (Alpha[-1] - Alpha[-n.Alpha]))
+        }
+      }
+    }
+  }
+  M_R_mm
+}
+# AH_MPL: Function to fit AH model 
+# input: 
+#   y: 1st column contains the ID number for subjects
+#      2nd column contains starting time of monitoring time interval 
+#      3rd column contains stopping time of monitoring time interval 
+#      4th column contains indicators, value of 1 indicates the stopping time of the corresponding monitoring time interval
+#          is the observed survival time and 0 the covariate changing time. (look at, particularly, the finite interval censored example below)
+#      5th column contains indicator variable. For each subject, at the end of each monitor time interval, the indicator value is 0 until
+#          at the last monitor time interval, at the end of which subject ceased to be investigated, 
+#          the value is 0 for right censoring, 1 for event, 2 for left-censoring, or 3 for interval-censoring. 
+#   X: covariates in AH regression
+#   control: model parameters in function AH_MPL.control
+#   Example for y, and X: 
+#   y                                                      X (time varying)                
+#   Id  2nd   3rd  4th  5th                                co-variate 1      co-variate 2   
+#   1    0     2    0    0                                    x_11              x_12           
+#   1    2     3    1    1 (uncensored at 3)                  y_11              y_12           
+#   2    0     1    0    0                                    x_21              x_22
+#   2    1     3    1    2 (left censored at 3)               y_21              y_22           
+#   3    0     1    0    0                                    x_31              x_32
+#   3    1     2    0    0                                    y_31              y_32              
+#   3    2     4    1    0                                    z_31              z_32
+#   3    4     5    0    0                                    z_31              z_32
+#   3    5     6    1    3 (interval censored in (4, 6))      w_31              w_32           
+#   4    0     2    0    0                                    x_41              x_42
+#   4    2     4    1    0 (right censored at 4)              y_41              y_42           
+# output:
+#   cvg: matrix with the 1st column containing the number of internal iterations, 
+#        the 2nd column containing mu values in each internal iteration,
+#        the 3rd column containing penalized log-likelihood in each internal iteration.
+#   Beta: coefficient estimates in AH regression
+#   Theta: basis estimates
+#   M2HM2: covariance of Theta and Beta
+#   cov.theta: covariance matrix of basis estimates
+#   se.beta: standard error of coefficient estimates in AH regression
+#   bins: results of bin for the basis
+#   ctype: censoring information matrix
+#   t_e, t_l, t_il, t_ir, and t_r are the uncensored, left-censored, interval-censored and right censored data, respectively.
+AH_MPL = function (y, X, control) 
+  {
+    # Observed survival data with censoring type 
+    n = length(unique(y[, 1]))
+    t_i1 = t_i2  = status = matrix(1, n, 1)
+    for (i in 1:n) {
+      y.subject = y[which(y[, 1]==i), , drop=FALSE]
+      n.monitor.time = nrow(y.subject)
+      censoring_status = y[, 5][which(y[, 1] == i)]
+      if (censoring_status[n.monitor.time] == 3) {
+        interval_left_id = y.subject[, 4]
+        t_i1[i] = y.subject[interval_left_id == 1, 3][1]
+        t_i2[i] = y.subject[n.monitor.time, 3]
+        status[i] = 3
+      }
+      else {
+        t_i1[i] = y.subject[n.monitor.time, 3]
+        status[i] = censoring_status[n.monitor.time]
+      }
+    }
+    ctype = matrix(NA, nrow = n, ncol = 4)
+    colnames(ctype) = c("r", "e", "l", "i")
+    for (tw in 1:4) {
+      ctype[, tw] = status == (tw - 1)
+    }
+    n.ctype = apply(ctype, 2, sum)
+    ties_1 = duplicated(t_i1)
+    if (any(ties_1)) {
+      t_i1[ties_1] = t_i1[ties_1] + runif(sum(ties_1), 0, 1e-5)
+    }
+    t_i2_r = t_i2[ctype[, 4]]
+    ties_2 = duplicated(t_i2_r)
+    if (any(ties_2)) {
+      t_i2_r[ties_2] = t_i2_r[ties_2] + runif(sum(ties_2), 0, 1e-5)
+      t_i2[ctype[, 4]] = t_i2_r
+    }
+    # covariate changing time points 
+    monitor_time_covar = matrix(subset(y[, 3], y[, 4] == 0))
+    n_monitor_covar = nrow(monitor_time_covar)
+    # Covariate observations 
+    beta_dim = ncol(X)
+    xt1 = Xt1 = matrix(0, n, 2 * beta_dim)
+    for (i in 1 : n ) {
+      M.subject = X[which(y[, 1] == i), , drop = FALSE]
+      y.subject = y[which(y[, 1]==i), , drop=FALSE]
+      n.monitor.time = nrow(y.subject)
+      if (status[i] == 3) {
+        interval_left_id = y.subject[, 4]
+        xt1[i, 1:beta_dim] = as.numeric(M.subject[interval_left_id == 1, ][1, ])
+        xt1[i, (beta_dim + 1):(2 * beta_dim)] = as.numeric(M.subject[n.monitor.time, ])
+        Xt1[i, 1:beta_dim] = colSums((y.subject[1 : which(interval_left_id == 1)[1], 3] - 
+                                        y.subject[1 : which(interval_left_id == 1)[1], 2]) *
+                                       M.subject[1 : which(interval_left_id == 1)[1], , drop = FALSE])
+        Xt1[i, (beta_dim + 1):(2 * beta_dim)] = colSums((y.subject[, 3] - y.subject[, 2]) * M.subject)
+      }
+      else {
+        xt1[i, 1:beta_dim] = as.numeric(M.subject[n.monitor.time, ]) 
+        Xt1[i, 1:beta_dim] = colSums((y.subject[, 3] - y.subject[, 2]) * M.subject)
+      }
+    }
+    M_xt1_nrp = xt1[ctype[, 1], (1:beta_dim), drop = F]
+    M_xt1_nop = xt1[ctype[, 2], (1:beta_dim), drop = F]
+    M_xt1_nlp = xt1[ctype[, 3], (1:beta_dim), drop = F]
+    M_xt1_nip = xt1[ctype[, 4], (1:beta_dim), drop = F]
+    M_xt2_nip = xt1[ctype[, 4], ((1 + beta_dim):(2 * beta_dim)), drop = F]
+    M_Xt1_nrp = Xt1[ctype[, 1], (1:beta_dim), drop = F]
+    M_Xt1_nop = Xt1[ctype[, 2], (1:beta_dim), drop = F]
+    M_Xt1_nlp = Xt1[ctype[, 3], (1:beta_dim), drop = F]
+    M_Xt1_nip = Xt1[ctype[, 4], (1:beta_dim), drop = F]
+    M_Xt2_nip = Xt1[ctype[, 4], ((1 + beta_dim):(2 * beta_dim)), drop = F]
+    M_txt1_nop = t(M_xt1_nop)
+    M_tXt1_nrp = t(M_Xt1_nrp)
+    M_tXt1_nop = t(M_Xt1_nop)
+    M_tXt1_nlp = t(M_Xt1_nlp)
+    M_tXt1_nip = t(M_Xt1_nip)
+    M_tXt2_nip = t(M_Xt2_nip)
+    M_x_m = subset(X, y[, 4] == 0)
+    # Basis functions 
+    bins = bins_mpl(control, t_i1, t_i2, ctype) 
+    M_R_mm = penalty_mpl(control, bins)
+    m = bins$m
+    M_Rstar_ll = rbind(cbind(M_R_mm, matrix(0, m, beta_dim)),
+                       matrix(0, beta_dim, m + beta_dim))
+    M_psi_nom = basis_mpl(t_i1, bins, control$basis, control$order,
+                          which = 1)[ctype[, 2], , drop = F]
+    M_tpsi_nom = t(M_psi_nom)
+    M_psi_nrm = basis_mpl(t_i1, bins, control$basis, control$order, 
+                          which = 1)[ctype[, 1], , drop = F]
+    M_psi_nlm = basis_mpl(t_i1, bins, control$basis, control$order, 
+                          which = 1)[ctype[, 3], , drop = F]
+    M_psi1_nim = basis_mpl(t_i1, bins, control$basis, control$order, 
+                           which = 1)[ctype[, 4], , drop = F]
+    M_psi2_nim = basis_mpl(t_i2, bins, control$basis, control$order,
+                           which = 1)[ctype[, 4], , drop = F]
+    M_Psi_nom = basis_mpl(t_i1, bins, control$basis, control$order, 
+                          which = 2)[ctype[, 2], , drop = F]
+    M_tPsi_nom = t(M_Psi_nom)
+    M_Psi_nrm = basis_mpl(t_i1, bins, control$basis, control$order, 
+                          which = 2)[ctype[, 1], , drop = F]
+    M_tPsi_nrm = t(M_Psi_nrm)
+    M_Psi_nlm = basis_mpl(t_i1, bins, control$basis, control$order,  
+                          which = 2)[ctype[, 3], , drop = F]
+    M_tPsi_nlm = t(M_Psi_nlm)
+    M_Psi1_nim = basis_mpl(t_i1, bins, control$basis, control$order, 
+                           which = 2)[ctype[, 4], , drop = F]
+    M_Psi2_nim = basis_mpl(t_i2, bins, control$basis, control$order, 
+                           which = 2)[ctype[, 4], , drop = F]
+    M_tPsi1_nim = t(M_Psi1_nim)
+    M_tPsi2_nim = t(M_Psi2_nim)
+    if (n_monitor_covar == 0) {
+      M_psi_m = NULL
+    }
+    else {
+      M_psi_m = basis_mpl(monitor_time_covar, bins, control$basis, control$order, which = 1)
+    }
+    # First derivatives of constraint function 
+    C_M_h0 = - cbind(diag(1,m), matrix(0, m, beta_dim))
+    C_M_ho = - cbind(M_psi_nom, M_xt1_nop)
+    C_M_hr = - cbind(M_psi_nrm, M_xt1_nrp)
+    C_M_hl = - cbind(M_psi_nlm, M_xt1_nlp)
+    C_M_hi1 = - cbind(M_psi1_nim, M_xt1_nip)
+    C_M_hi2 = - cbind(M_psi2_nim, M_xt2_nip)
+    if (n_monitor_covar == 0) {
+      C_M_m = NULL
+    }
+    else {
+      C_M_m = - cbind(M_psi_m, M_x_m)
+    }
+    C_M = rbind(C_M_h0, C_M_ho, C_M_hr, C_M_hl, C_M_hi1, C_M_hi2, C_M_m)
+    # initial smooth parameter 
+    s_gamma = control$smooth
+    # number of internal iterations
+    K = control$max.iter[2]
+    # parameters of the PD algorithm
+    tau = control$tau
+    xi = 0.5
+    # tolerance in the internal algorithm 
+    s_convlimit = control$tol_1
+    # initial value of denominator in smooth parameter selection algorithm 
+    s_df = -1
+    # initial value of iteration steps 
+    full.iter = 0
+    # algorithm 
+    for (iter in 1: control$max.iter[1]) {
+      # initial values 
+      M_theta_m1 = matrix(1, nrow = m, ncol = 1)
+      M_beta_p1 = matrix(0, nrow = beta_dim, ncol = 1)
+      M_eta = rbind(M_theta_m1, M_beta_p1)
+      M_lambda = M_s = matrix(1, nrow = m + n + n.ctype[4] + n_monitor_covar, ncol = 1)
+      mu = sum(M_lambda * M_s)/as.numeric(m + n + n.ctype[4] + n_monitor_covar)
+      # Baseline and cumulative baseline hazard 
+      M_h0_no1 = M_psi_nom %*% M_theta_m1
+      M_H0_nl1 = M_Psi_nlm %*% M_theta_m1
+      M_H01_ni1 = M_Psi1_nim %*% M_theta_m1
+      M_H02_ni1 = M_Psi2_nim %*% M_theta_m1
+      # hazard and cumulative Hazard 
+      M_h_no1 = M_h0_no1 + M_xt1_nop %*% M_beta_p1
+      M_H_nl1 = M_H0_nl1 + M_Xt1_nlp %*% M_beta_p1
+      M_H1_ni1 = M_H01_ni1 + M_Xt1_nip %*% M_beta_p1
+      M_H2_ni1 = M_H02_ni1 + M_Xt2_nip %*% M_beta_p1
+      # Survival functions 
+      M_S_nl1 = exp(-M_H_nl1)
+      M_S1_ni1 = exp(-M_H1_ni1)
+      M_S2_ni1 = exp(-M_H2_ni1)
+      M_S_nl1[M_S_nl1 == 1] = 1 - 1e-16
+      M_S1_ni1[M_S1_ni1 == 1] = 1 - 1e-16
+      M_S2_ni1[M_S2_ni1 == 1] = 1 - 1e-16
+      M_S1mS2_ni1 = M_S1_ni1 - M_S2_ni1
+      M_S1mS2_ni1[M_S1mS2_ni1 < 1e-10] = 1e-10
+      # First derivative of objective function
+      M_gradtheta_m1 = M_tpsi_nom %*% (1/M_h_no1) - M_tPsi_nom %*% matrix(1, nrow = n.ctype[2], ncol = 1) -
+        M_tPsi_nrm %*% matrix(1, nrow = n.ctype[1], ncol = 1) + M_tPsi_nlm %*% (M_S_nl1/(1 - M_S_nl1)) + 
+        M_tPsi2_nim %*% (M_S2_ni1/M_S1mS2_ni1) - M_tPsi1_nim %*% (M_S1_ni1/M_S1mS2_ni1) 
+      M_gradbeta_p1 = (M_txt1_nop %*% (1 / M_h_no1) - M_tXt1_nop %*% matrix(1, nrow = n.ctype[2], ncol = 1)) - M_tXt1_nrp %*% 
+        matrix(1, nrow = n.ctype[1], ncol = 1) + M_tXt1_nlp %*% (M_S_nl1/(1 - M_S_nl1)) + (M_tXt2_nip %*% (M_S2_ni1/(M_S1mS2_ni1)) -
+                                                                                             M_tXt1_nip %*% (M_S1_ni1/(M_S1mS2_ni1)))
+      Rtheta = M_R_mm %*% M_theta_m1
+      TwoLRtheta = s_gamma * 2 * Rtheta
+      PL_FD =  -(rbind(M_gradtheta_m1, M_gradbeta_p1) - rbind(TwoLRtheta, matrix(0, beta_dim)))
+      # collection of mu values and penalized log-likelihood
+      cvg = matrix(0, K, 3)
+      # internal algorithm
+      for (k in 1:K) {
+        # second derivative for objective function
+        H = matrix(0, beta_dim + m, beta_dim + m)
+        H[1:m, 1:m] = - M_tpsi_nom %*% diag(c(1/M_h_no1^2), n.ctype[2], n.ctype[2]) %*% M_psi_nom -
+          M_tPsi_nlm %*% diag(c(M_S_nl1/(1-M_S_nl1)^2), n.ctype[3], n.ctype[3]) %*% M_Psi_nlm - 
+          (M_tPsi2_nim - M_tPsi1_nim) %*% diag(c(M_S1_ni1 * M_S2_ni1/M_S1mS2_ni1^2), 
+                                               n.ctype[4], n.ctype[4]) %*% (M_Psi2_nim - M_Psi1_nim)
+        H[(m+1):(m+beta_dim), 1:m] = - M_txt1_nop %*% diag(c(1/M_h_no1^2), n.ctype[2], n.ctype[2]) %*% M_psi_nom -
+          M_tXt1_nlp %*% diag(c(M_S_nl1/(1-M_S_nl1)^2), n.ctype[3], n.ctype[3]) %*% M_Psi_nlm -
+          (M_tXt2_nip - M_tXt1_nip) %*% diag(
+            c(M_S1_ni1 * M_S2_ni1/M_S1mS2_ni1^2), n.ctype[4], n.ctype[4]) %*% (M_Psi2_nim - M_Psi1_nim)
+        H[(m+1):(m+beta_dim), (m+1):(m+beta_dim)] = - M_txt1_nop %*% diag(c(1/M_h_no1^2), n.ctype[2], n.ctype[2]) %*% M_xt1_nop -
+          M_tXt1_nlp %*% diag(c(M_S_nl1/(1-M_S_nl1)^2), n.ctype[3], n.ctype[3]) %*% M_Xt1_nlp -
+          (M_tXt2_nip - M_tXt1_nip) %*% diag(c(M_S1_ni1 * M_S2_ni1/M_S1mS2_ni1^2), n.ctype[4], n.ctype[4]) %*% (M_Xt2_nip - M_Xt1_nip)
+        H[1:m, (m+1):(m+beta_dim)] = t(H[(m+1):(m+beta_dim), 1:m])
+        SD_PL = -(H - s_gamma * 2 * M_Rstar_ll)
+        # Newton direction
+        D = solve(diag(c(M_s))) %*% diag(c(M_lambda))
+        D_eta = solve(SD_PL + t(C_M) %*% D %*% C_M) %*% 
+          (-PL_FD - t(C_M) %*% M_lambda - t(C_M) %*% D %*% (C_M %*% M_eta) - 
+             xi * mu * t(C_M) %*% solve(diag(c(M_s))) %*% matrix(1, n + m + n.ctype[4] + n_monitor_covar, 1))
+        D_lambda = solve(diag(c(M_s))) %*% (diag(c(M_lambda)) %*% C_M %*% D_eta + diag(c(M_lambda)) %*% (C_M %*% M_eta) +
+                                              xi * mu * matrix(1, n + m + n.ctype[4] + n_monitor_covar, 1))
+        D_s = -solve(diag(c(M_lambda))) %*% (diag(c(M_lambda)) %*% diag(c(M_s)) %*% matrix(1, n + m + n.ctype[4] + n_monitor_covar, 1) - 
+                                               xi * mu * matrix(1, n + m + n.ctype[4] + n_monitor_covar, 1) + diag(c(M_s)) %*% D_lambda)
+        # New estimates
+        M_eta_OLD = M_eta
+        M_lambda_OLD = M_lambda
+        M_s_OLD = M_s
+        mu_OLD = mu
+        mu_bound = (1 - 0.01) * mu_OLD
+        alpha = 1
+        repeat{
+          M_eta = M_eta_OLD + alpha * D_eta
+          M_theta_m1 = matrix(M_eta[1 : m])
+          M_beta_p1 = matrix(M_eta[(m + 1) : (m + beta_dim)])
+          M_lambda = M_lambda_OLD + alpha * D_lambda
+          M_s = M_s_OLD + alpha * D_s
+          mu = sum(M_lambda * M_s)/(n + m + n.ctype[4] + n_monitor_covar)
+          # new baseline hazard and cumulative hazard
+          M_h0_no1 = M_psi_nom %*% M_theta_m1
+          M_h0_nr1 = M_psi_nrm %*% M_theta_m1
+          M_h0_nl1 = M_psi_nlm %*% M_theta_m1
+          M_h01_ni1 = M_psi1_nim %*% M_theta_m1
+          M_h02_ni1 = M_psi2_nim %*% M_theta_m1
+          if (n_monitor_covar == 0) {
+            M_h0_m = NULL
+          }
+          else {
+            M_h0_m = M_psi_m %*% M_theta_m1
+          }
+          M_H0_no1 = M_Psi_nom %*% M_theta_m1
+          M_H0_nr1 = M_Psi_nrm %*% M_theta_m1
+          M_H0_nl1 = M_Psi_nlm %*% M_theta_m1
+          M_H01_ni1 = M_Psi1_nim %*% M_theta_m1
+          M_H02_ni1 = M_Psi2_nim %*% M_theta_m1
+          # new hazard and cumulative Hazard
+          M_h_no1 = M_h0_no1 + M_xt1_nop %*% M_beta_p1
+          M_h_nr1 = M_h0_nr1 + M_xt1_nrp %*% M_beta_p1
+          M_h_nl1 = M_h0_nl1 + M_xt1_nlp %*% M_beta_p1
+          M_h1_ni1 = M_h01_ni1 + M_xt1_nip %*% M_beta_p1
+          M_h2_ni1 = M_h02_ni1 + M_xt2_nip %*% M_beta_p1
+          if (n_monitor_covar == 0) {
+            M_h_m = NULL
+          }
+          else {
+            M_h_m = M_h0_m + M_x_m %*% M_beta_p1
+          }
+          M_H_no1 = M_H0_no1 + M_Xt1_nop %*% M_beta_p1
+          M_H_nr1 = M_H0_nr1 + M_Xt1_nrp %*% M_beta_p1
+          M_H_nl1 = M_H0_nl1 + M_Xt1_nlp %*% M_beta_p1
+          M_H1_ni1 = M_H01_ni1 + M_Xt1_nip %*% M_beta_p1
+          M_H2_ni1 = M_H02_ni1 + M_Xt2_nip %*% M_beta_p1
+          # new survival
+          M_S_nl1 = exp(-M_H_nl1)
+          M_S1_ni1 = exp(-M_H1_ni1)
+          M_S2_ni1 = exp(-M_H2_ni1)
+          M_S_nl1[M_S_nl1 == 1] = 1 - 1e-16
+          M_S1_ni1[M_S1_ni1 == 1] = 1 - 1e-16
+          M_S2_ni1[M_S2_ni1 == 1] = 1 - 1e-16
+          M_S1mS2_ni1 = M_S1_ni1 - M_S2_ni1
+          M_S1mS2_ni1[M_S1mS2_ni1 < 1e-10] = 1e-10
+          # new first derivative of objective function
+          M_gradtheta_m1 = M_tpsi_nom %*% (1/M_h_no1) - M_tPsi_nom %*% matrix(1, nrow = n.ctype[2], ncol = 1) -
+            M_tPsi_nrm %*% matrix(1, nrow = n.ctype[1], ncol = 1) + M_tPsi_nlm %*% (M_S_nl1/(1 - M_S_nl1)) + 
+            M_tPsi2_nim %*% (M_S2_ni1/M_S1mS2_ni1) - M_tPsi1_nim %*% (M_S1_ni1/M_S1mS2_ni1) 
+          M_gradbeta_p1 = M_txt1_nop %*% (1/M_h_no1) - M_tXt1_nop %*% matrix(1, nrow = n.ctype[2], ncol = 1) - M_tXt1_nrp %*% 
+            matrix(1, nrow = n.ctype[1], ncol = 1) + M_tXt1_nlp %*% (M_S_nl1/(1 - M_S_nl1)) + M_tXt2_nip %*% (M_S2_ni1/M_S1mS2_ni1) -
+            M_tXt1_nip %*% (M_S1_ni1/M_S1mS2_ni1)
+          Rtheta = M_R_mm %*% M_theta_m1
+          TwoLRtheta = s_gamma * 2 * Rtheta
+          PL_FD = -(rbind(M_gradtheta_m1, M_gradbeta_p1) - rbind(TwoLRtheta, matrix(0, beta_dim)))
+          # new constraint functions
+          f = - rbind(M_theta_m1, M_h_no1, M_h_nr1, M_h_nl1, M_h1_ni1, M_h2_ni1, M_h_m)
+          # neighbour
+          if (sqrt(t(PL_FD + t(C_M) %*% M_lambda) %*% (PL_FD + t(C_M) %*% M_lambda)) <= tau * mu_OLD & 
+              sqrt(t(f + M_s) %*% (f + M_s)) <= tau * mu_OLD & 
+              all(c(M_lambda * M_s) >= 0.5 *mu_OLD) &
+              all(c(M_lambda, M_s) >= 0) & mu <= mu_bound)
+            break
+          # select the step length
+          kapa = 0.6
+          alpha = alpha * kapa
+          # mu bound
+          mu_bound = (1 - 0.01 * alpha) * mu_OLD
+        }
+        cvg[k, 1] = k
+        cvg[k, 2] = mu
+        cvg[k, 3] = sum(log(M_h_no1) - M_H_no1) - sum(M_H_nr1) + sum(log(1 - M_S_nl1)) + 
+          sum(log(M_S1mS2_ni1)) - s_gamma * t(M_theta_m1) %*% M_R_mm %*% M_theta_m1
+        print(k)
+        if (cvg[k, 2] < s_convlimit){
+          cvg = cvg[1:k, ]
+          break
+        }
+      }
+      # External Iteration 
+      H = HRinv = matrix(0, beta_dim + m, beta_dim + m)
+      H[1:m, 1:m] = - M_tpsi_nom %*% diag(c(1/M_h_no1^2), n.ctype[2], n.ctype[2]) %*% M_psi_nom -
+        M_tPsi_nlm %*% diag(c(M_S_nl1/(1-M_S_nl1)^2), n.ctype[3], n.ctype[3]) %*% M_Psi_nlm - 
+        (M_tPsi2_nim - M_tPsi1_nim) %*% diag(c(M_S1_ni1 * M_S2_ni1/M_S1mS2_ni1^2), 
+                                             n.ctype[4], n.ctype[4]) %*% (M_Psi2_nim - M_Psi1_nim)
+      H[(m+1):(m+beta_dim), 1:m] = - M_txt1_nop %*% diag(c(1/M_h_no1^2), n.ctype[2], n.ctype[2]) %*% M_psi_nom -
+        M_tXt1_nlp %*% diag(c(M_S_nl1/(1-M_S_nl1)^2), n.ctype[3], n.ctype[3]) %*% M_Psi_nlm -
+        (M_tXt2_nip - M_tXt1_nip) %*% diag(
+          c(M_S1_ni1 * M_S2_ni1/M_S1mS2_ni1^2), n.ctype[4], n.ctype[4]) %*% (M_Psi2_nim - M_Psi1_nim)
+      H[(m+1):(m+beta_dim), (m+1):(m+beta_dim)] = - M_txt1_nop %*% diag(c(1/M_h_no1^2), n.ctype[2], n.ctype[2]) %*% M_xt1_nop -
+        M_tXt1_nlp %*% diag(c(M_S_nl1/(1-M_S_nl1)^2), n.ctype[3], n.ctype[3]) %*% M_Xt1_nlp -
+        (M_tXt2_nip - M_tXt1_nip) %*% diag(c(M_S1_ni1 * M_S2_ni1/M_S1mS2_ni1^2), n.ctype[4], n.ctype[4]) %*% (M_Xt2_nip - M_Xt1_nip)
+      H[1:m, (m+1):(m+beta_dim)] = t(H[(m+1):(m+beta_dim), 1:m])
+      s_gamma_old = s_gamma
+      s_df_old = s_df
+      s_sigma2_old = 1 / (2 * s_gamma_old)
+      pos = c((M_theta_m1 > control$min.theta), rep(TRUE, beta_dim))
+      HRinv[pos, pos] = solve(-H[pos, pos] + (1/s_sigma2_old) * 
+                                M_Rstar_ll[pos, pos])
+      s_df = m - sum(diag(HRinv %*% M_Rstar_ll))/s_sigma2_old
+      s_sigma2 = c(t(M_theta_m1) %*% M_R_mm %*% M_theta_m1/s_df)
+      s_gamma = 1/(2 * s_sigma2)
+      full.iter = full.iter + k
+      if (full.iter > control$max.iter[3]) {
+        break
+      }
+      if (abs(s_df - s_df_old) < control$tol_2) {
+        break
+      }
+    }
+    s_gamma  = s_gamma_old
+    M_2 = -H + 2 * s_gamma * M_Rstar_ll
+    HesbinvD = matrix(diag(solve(-H[(m + 1):(m + beta_dim), (m + 1):(m + beta_dim)])))
+    Minv_2 = matrix(0, m + beta_dim, m + beta_dim)
+    pos = c((M_theta_m1 > control$min.theta), rep(TRUE, beta_dim))
+    temp = solve(M_2[pos, pos])
+    Minv_2[pos, pos] = temp
+    cov_NuNu_M2HM2 = Minv_2 %*% (-H) %*% Minv_2
+    cov.theta = cov_NuNu_M2HM2[1:m, 1:m]
+    var.beta = matrix(diag(cov_NuNu_M2HM2[(m + 1):(m + beta_dim), (m + 1):(m + beta_dim)]))
+    var.beta[var.beta < 0] = HesbinvD[var.beta < 0]
+    se.beta = sqrt(var.beta)
+    colnames(se.beta) = c("se")
+    rownames(se.beta) = paste("beta", 1:beta_dim, sep = "")
+    Beta = M_beta_p1
+    colnames(Beta) = c("estimate")
+    rownames(Beta) = paste("beta", 1:beta_dim, sep = "")
+    return(list(cvg = cvg, Beta = Beta, Theta = c(M_theta_m1) * (M_theta_m1 > control$min.theta),
+                M2HM2 = cov_NuNu_M2HM2, cov.theta = cov.theta, se.beta = se.beta, bins = bins,
+                t_il = c(t_i1[ctype[, "i"]]), t_ir = c(t_i2[ctype[, "i"]]), t_r = c(t_i1[ctype[, "r"]]), 
+                t_l = c(t_i1[ctype[, "l"]]), t_e = c(t_i1[ctype[, "e"]]), ctype = ctype))
+  }
+# predict function (predict.ah_mpl)
+# Input:
+#   fit: estimation results for AH model
+#   type = "hazard", predicted hazard; type = "survival" predicted survival
+#   time: evaluated time 
+#   x_t : n_t times p matrix for covariates (time independent or time varying) at the evaluated time,
+#         where n_t is the number of time points evaluated, and p is the beta dimension
+#   X_t : n_t times p matrix for integration of covariates, integrating from initial time to the evaluated time
+#   control: model parameters in function AH_MPL.control
+# Output:
+#   out: the 1st column the time point evaluated
+#        the 2nd column the predicted value
+#        the 3rd column the standard deviation
+#        the 4th and 5th columns 95% linear confidence interval
+
+predict.ah_mpl = function (fit, type = "hazard", time = NULL, x_t, X_t, control) 
+{
+  covar = fit$M2HM2
+  Beta = fit$Beta
+  Theta = fit$Theta
+  p = length(Beta)
+  m = length(Theta)
+  if (is.null(time)) {
+    n.x = 1000
+    V_x_X = seq(fit$bins$Alpha[1], max(fit$bins$Alpha), 
+                length = n.x)
+  }
+  else {
+    n.x = length(time)
+    V_x_X = time
+  }
+  out = data.frame(time = V_x_X, mid = NA, se = NA, l_low = NA, l_high = NA)
+  if (type == "hazard") {
+    M_psi_Xm = basis_mpl(V_x_X, fit$bins, control$basis, control$order, which = 1)
+    out$mid = x_t %*% Beta + M_psi_Xm %*% Theta
+    M_corr_mpm = cbind(M_psi_Xm, x_t)
+    out$se = sqrt(diag(M_corr_mpm %*% covar %*% t(M_corr_mpm)))
+    out$l_low = out$mid - 1.96 * out$se
+    out$l_low[out$l_low < 0] = 0
+    out$l_high = out$mid + 1.96 * out$se
+  }
+  else {
+    M_Psi_Xm = basis_mpl(V_x_X, fit$bins, control$basis, control$order, which = 2)
+    out$mid = exp(-X_t %*% Beta - M_Psi_Xm %*% Theta)
+    out$mid[out$mid>1] = 1 - runif(1)*(1e-5)
+    M_corr_mpm = -cbind(diag(c(out$mid)) %*% M_Psi_Xm, diag(c(out$mid)) %*% X_t)
+    out$se = sqrt(diag(M_corr_mpm %*% covar %*% t(M_corr_mpm)))
+    out$l_low = out$mid - 1.96 * out$se
+    out$l_low[out$l_low < 0] = 0
+    out$l_high = out$mid + 1.96 * out$se
+    out$l_high[out$l_high > 1] = 1
+  }
+  out
+}
+# plot function (plot.ah_mpl) 
+# Plots of basis (1), baseline hazard (2), cumulative baseline hazard (3) and baseline survival (4)
+plot.ah_mpl=
+  function (x, ask = TRUE, which = 1:4, control) 
+  {
+    which.plot = rep(TRUE, 4)
+    if (!is.null(which)) {
+      which.plot[-which] = FALSE
+    }
+    if (sum(which.plot) == 1) {
+      ask = FALSE
+    }
+    if (ask) {
+      oask <- devAskNewPage(TRUE)
+      on.exit(devAskNewPage(oask))
+    }
+    knots = x$bins
+    pos = x$Theta < control$min.theta
+    n.x = 1000
+    V_x_X = seq(min(knots$Alpha), max(knots$Alpha), length = n.x)
+    colw = terrain.colors(knots$m + 1)
+    M_psi_Xm = basis_mpl(V_x_X, knots, control$basis, control$order, 
+                         which = 1)
+    if (which.plot[1]) {
+      plot(1, 1, pch = "", xlim = range(V_x_X), ylim = max(M_psi_Xm) * 
+             c(-0.05, 1), axes = FALSE, xlab = "Survival time", 
+           ylab = expression(psi[u] * (t)), main = paste(if (control$basis == "uniform") {
+             "Uniform"
+           }
+           else {
+             if (control$basis == "gaussian") {
+               "Gaussian"
+             }
+             else {
+               if (control$basis == "msplines") {
+                 "M-spline"
+               }
+             }
+           }, " bases used to approximate the baseline hazard\n", 
+           "(", knots$m, " bases)", sep = ""))
+      abline(v = knots$Alpha, col = gray(0.9))
+      for (u in 1:knots$m) {
+        lines(V_x_X, M_psi_Xm[, u], col = colw[u], lty = 2 * 
+                pos[u] + 1)
+      }
+      axis(2, las = 2)
+      axis(1)
+    }
+    if (any(which.plot[2:4])) {
+      plot_bh <- function(j, V_x_X, Theta, covar, control, 
+                          knots, pos, xlim) {
+        M_Ppsi_Xm = basis_mpl(V_x_X, knots, control$basis, 
+                              control$order, which = as.numeric(j > 1) + 1)
+        V_sd2.Hh0.X = diag(M_Ppsi_Xm[, ] %*% covar[, ] %*% 
+                             t(M_Ppsi_Xm[, ]))
+        pos.var = V_sd2.Hh0.X > 0
+        V_Hh0_X = c(M_Ppsi_Xm %*% matrix(Theta, ncol = 1))[pos.var]
+        V_x_X = V_x_X[pos.var]
+        V_sd.Hh0.X = sqrt(V_sd2.Hh0.X[pos.var])
+        upper = V_Hh0_X + 2 * V_sd.Hh0.X
+        lower = V_Hh0_X - 2 * V_sd.Hh0.X
+        lower[lower < 0] = 0
+        if (j == 3) {
+          V_Hh0_X = exp(-V_Hh0_X)
+          lower = exp(-lower)
+          upper = exp(-upper)
+        }
+        plot(1, 1, pch = "", xlim = xlim, axes = FALSE, ylim = c(ifelse(j < 
+                                                                          3, 0, min(upper[V_x_X < xlim[2]])), ifelse(j < 
+                                                                                                                       3, max(upper[V_x_X < xlim[2]]), max(lower[V_x_X < 
+                                                                                                                                                                   xlim[2]]))), main = paste("Estimate of the", 
+                                                                                                                                                                                             c(" baseline hazard", " cumulative baseline hazard", 
+                                                                                                                                                                                               " baseline survival")[j], " function", sep = ""), 
+             xlab = "Survival time", ylab = c(expression(h[0] * 
+                                                           (t)), expression(H[0] * (t)), expression(S[0] * 
+                                                                                                      (t)))[j])
+        axis(2, pos = 0, las = 2)
+        axis(1, pos = 0)
+        xx = c(V_x_X, V_x_X[length(V_x_X):1])
+        yy = c(upper, lower[length(V_x_X):1])
+        confcol = paste(substr(colw[length(Theta)], 1, 7), 
+                        70, sep = "")
+        polygon(xx, yy, col = confcol, border = "gray")
+        lines(V_x_X, V_Hh0_X, lwd = 1.1, col = colw[1])
+        legend(ifelse(j < 3, "topleft", "topright"), legend = c("Estimate", 
+                                                                "95% conf. interval"), pch = c(NA, 15), lty = c(1, 
+                                                                                                                0), col = c(colw[1], confcol), 
+               ncol = 1, bty = "n", cex = 0.75)
+      }
+      cov_ThetaTheta = x$cov.theta
+      xlim = range(knots$Alpha)
+      if (which.plot[2]) {
+        plot_bh(1, V_x_X, x$Theta, cov_ThetaTheta, control, 
+                knots, pos, xlim)
+      }
+      if (which.plot[3]) {
+        plot_bh(2, V_x_X, x$Theta, cov_ThetaTheta, control, 
+                knots, pos, xlim)
+      }
+      if (which.plot[4]) {
+        plot_bh(3, V_x_X, x$Theta, cov_ThetaTheta, control, 
+                knots, pos, xlim)
+      }
+    }
+  }
